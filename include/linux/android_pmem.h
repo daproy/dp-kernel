@@ -34,14 +34,6 @@
  */
 #define PMEM_GET_TOTAL_SIZE	_IOW(PMEM_IOCTL_MAGIC, 7, unsigned int)
 
-int is_pmem_file(struct file *file);
-int get_pmem_file(int fd, unsigned long *start, unsigned long *vstart,
-		  unsigned long *end, struct file **filp);
-int get_pmem_user_addr(struct file *file, unsigned long *start,
-		       unsigned long *end);
-void put_pmem_file(struct file* file);
-void flush_pmem_file(struct file *file, unsigned long start, unsigned long len);
-
 struct android_pmem_platform_data
 {
 	const char* name;
