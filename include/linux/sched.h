@@ -965,16 +965,14 @@ struct task_struct {
 	int lock_depth;		/* BKL lock depth */
 
 	int oncpu;
-	int load_weight;	/* for niceness load balancing purposes */
 	int prio, static_prio, normal_prio;
 	int time_slice, first_time_slice;
 	unsigned long deadline;
 	struct list_head run_list;
 	unsigned int rt_priority;
-	unsigned long long timestamp, last_ran;
+	u64 last_ran;
 	u64 sched_time; /* sched_clock time spent running */
 
-	int rt_nr_cpus_allowed;
 	unsigned long rt_timeout;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
