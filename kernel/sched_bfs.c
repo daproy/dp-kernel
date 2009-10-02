@@ -144,13 +144,24 @@ int rr_interval __read_mostly = 6;
  */
 int sched_iso_cpu __read_mostly = 70;
 
+/*
+ * The relative length of deadline for each priority(nice) level.
+ */
 int prio_ratios[PRIO_RANGE] __read_mostly;
 
+/*
+ * The quota handed out to tasks of all priority levels when refilling their
+ * time_slice.
+ */
 static inline unsigned long timeslice(void)
 {
 	return MS_TO_US(rr_interval);
 }
 
+/*
+ * The global runqueue data that all CPUs work off. All data is protected
+ * by grq.lock.
+ */
 struct global_rq {
 	spinlock_t lock;
 	unsigned long nr_running;
@@ -166,11 +177,12 @@ struct global_rq {
 #endif
 };
 
+/* There can be only one */
 static struct global_rq grq;
 
 /*
  * This is the main, per-CPU runqueue data structure.
- * All this is protected by the global_rq lock.
+ * This data should only be modified by the local cpu.
  */
 struct rq {
 #ifdef CONFIG_SMP
@@ -201,6 +213,7 @@ struct rq {
 #ifdef CONFIG_SMP
 	struct root_domain *rd;
 	struct sched_domain *sd;
+	unsigned long *cpu_locality; /* CPU relative cache distance */
 
 	struct list_head migration_queue;
 #endif
@@ -269,7 +282,6 @@ struct root_domain {
  * members (mimicking the global state we have today).
  */
 static struct root_domain def_root_domain;
-
 #endif
 
 static inline int cpu_of(struct rq *rq)
@@ -305,6 +317,11 @@ static inline int cpu_of(struct rq *rq)
 # define finish_arch_switch(prev)	do { } while (0)
 #endif
 
+/*
+ * All common locking functions performed on grq.lock. rq->clock is local to
+ * the cpu accessing it so it can be modified just with interrupts disabled,
+ * but looking up task_rq must be done under grq.lock to be safe.
+ */
 inline void update_rq_clock(struct rq *rq)
 {
 	rq->clock = sched_clock_cpu(cpu_of(rq));
@@ -318,7 +335,6 @@ static inline int task_running(struct task_struct *p)
 static inline void grq_lock(void)
 	__acquires(grq.lock)
 {
-	smp_mb();
 	spin_lock(&grq.lock);
 }
 
@@ -331,15 +347,14 @@ static inline void grq_unlock(void)
 static inline void grq_lock_irq(void)
 	__acquires(grq.lock)
 {
-	smp_mb();
 	spin_lock_irq(&grq.lock);
 }
 
 static inline void time_lock_grq(struct rq *rq)
 	__acquires(grq.lock)
 {
-	grq_lock();
 	update_rq_clock(rq);
+	grq_lock();
 }
 
 static inline void grq_unlock_irq(void)
@@ -351,8 +366,7 @@ static inline void grq_unlock_irq(void)
 static inline void grq_lock_irqsave(unsigned long *flags)
 	__acquires(grq.lock)
 {
-	local_irq_save(*flags);
-	grq_lock();
+	spin_lock_irqsave(&grq.lock, *flags);
 }
 
 static inline void grq_unlock_irqrestore(unsigned long *flags)
@@ -488,14 +502,11 @@ static inline void finish_lock_switch(struct rq *rq, struct task_struct *prev)
 #endif /* __ARCH_WANT_UNLOCKED_CTXSW */
 
 /*
- * A task that is queued will be on the grq run list.
+ * A task that is queued but not running will be on the grq run list.
  * A task that is not running or queued will not be on the grq run list.
- * A task that is currently running will have ->oncpu set and be queued
- * temporarily in its own rq queue.
- * A task that is running and no longer queued will be seen only on
- * context switch exit.
+ * A task that is currently running will have ->oncpu set but not on the
+ * grq run list.
  */
-
 static inline int task_queued(struct task_struct *p)
 {
 	return (!list_empty(&p->run_list));
@@ -615,6 +626,19 @@ static inline void resched_suitable_idle(struct task_struct *p)
 		wake_up_idle_cpu(first_cpu(tmp));
 }
 
+/*
+ * The cpu cache locality difference between CPUs is used to determine how far
+ * to offset the virtual deadline. "One" difference in locality means that one
+ * timeslice difference is allowed longer for the cpu local tasks. This is
+ * enough in the common case when tasks are up to 2* number of CPUs to keep
+ * tasks within their shared cache CPUs only. See sched_init_smp for how
+ * locality is determined.
+ */
+static inline int
+cache_distance(struct rq *task_rq, struct rq *rq, struct task_struct *p)
+{
+	return rq->cpu_locality[task_rq->cpu] * task_timeslice(p);
+}
 #else /* CONFIG_SMP */
 static inline void inc_qnr(void)
 {
@@ -645,6 +669,12 @@ static inline int suitable_idle_cpus(struct task_struct *p)
 
 static inline void resched_suitable_idle(struct task_struct *p)
 {
+}
+
+static inline int
+cache_distance(struct rq *task_rq, struct rq *rq, struct task_struct *p)
+{
+	return 0;
 }
 #endif /* CONFIG_SMP */
 
@@ -901,9 +931,13 @@ unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 		 * We do the initial early heuristics without holding
 		 * any task-queue locks at all. We'll only try to get
 		 * the runqueue lock when things look like they will
-		 * work out!
+		 * work out! In the unlikely event rq is dereferenced
+		 * since we're lockless, grab it again.
 		 */
+retry_rq:
 		rq = task_rq(p);
+		if (unlikely(!rq))
+			goto retry_rq;
 
 		/*
 		 * If the task is actively running on another CPU
@@ -912,9 +946,9 @@ unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 		 *
 		 * NOTE! Since we don't hold any locks, it's not
 		 * even sure that "rq" stays as the right runqueue!
-		 * But we don't care, since this will
-		 * return false if the runqueue has changed and p
-		 * is actually now running somewhere else!
+		 * But we don't care, since this will return false
+		 * if the runqueue has changed and p is actually now
+		 * running somewhere else!
 		 */
 		while (task_running(p) && p == rq->curr) {
 			if (match_state && unlikely(p->state != match_state))
@@ -1009,19 +1043,22 @@ EXPORT_SYMBOL_GPL(kick_process);
 
 /*
  * RT tasks preempt purely on priority. SCHED_NORMAL tasks preempt on the
- * basis of earlier deadlines. SCHED_BATCH and SCHED_IDLEPRIO don't preempt,
- * they cooperatively multitask.
+ * basis of earlier deadlines. SCHED_BATCH, ISO and IDLEPRIO don't preempt
+ * between themselves, they cooperatively multitask.
  */
 static inline int task_preempts_curr(struct task_struct *p, struct rq *rq)
 {
-	int preempts = 0;
-
 	if (p->prio < rq->rq_prio)
-		preempts = 1;
-	else if (p->policy == SCHED_NORMAL && (p->prio == rq->rq_prio &&
-		 time_before(p->deadline, rq->rq_deadline)))
-			preempts = 1;
-	return preempts;
+		return 1;
+	if (p->policy == SCHED_NORMAL) {
+		unsigned long p_deadline = p->deadline +
+			cache_distance(task_rq(p), rq, p);
+
+		if ((p->prio == rq->rq_prio &&
+		    time_before(p_deadline, rq->rq_deadline)))
+			return 1;
+	}
+	return 0;
 }
 
 /*
@@ -1116,6 +1153,9 @@ static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
 	int success = 0;
 	struct rq *rq;
 
+	/* This barrier is undocumented, probably for p->state? くそ */
+	smp_wmb();
+
 	/*
 	 * No need to do time_lock_grq as we only need to update the rq clock
 	 * if we activate the task
@@ -1123,7 +1163,7 @@ static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
 	rq = task_grq_lock(p, &flags);
 
 	/* state is a volatile long, どうして、分からない */
-	if (!(unsigned int)p->state & state)
+	if (!((unsigned int)p->state & state))
 		goto out_unlock;
 
 	if (task_queued(p) || task_running(p))
@@ -1269,7 +1309,7 @@ void wake_up_new_task(struct task_struct *p, unsigned long clone_flags)
 /*
  * Potentially available exiting-child timeslices are
  * retrieved here - this way the parent does not get
- * penalized for creating too many threads.
+ * penalised for creating too many threads.
  *
  * (this cannot be used to 'generate' timeslices
  * artificially, because any timeslice recovered here
@@ -1282,11 +1322,22 @@ void sched_exit(struct task_struct *p)
 	struct rq *rq;
 
 	if (p->first_time_slice) {
+		int *par_tslice, *p_tslice;
+
 		parent = p->parent;
 		rq = task_grq_lock(parent, &flags);
-		parent->time_slice += p->time_slice;
-		if (unlikely(parent->time_slice > timeslice()))
-			parent->time_slice = timeslice();
+		par_tslice = &parent->time_slice;
+		p_tslice = &p->time_slice;
+
+		/* The real time_slice of the "curr" task is on the rq var.*/
+		if (p == rq->curr)
+			p_tslice = &rq->rq_time_slice;
+		else if (parent == task_rq(parent)->curr)
+			par_tslice = &rq->rq_time_slice;
+
+		*par_tslice += *p_tslice;
+		if (unlikely(*par_tslice > timeslice()))
+			*par_tslice = timeslice();
 		task_grq_unlock(&flags);
 	}
 }
@@ -1928,20 +1979,17 @@ void account_idle_ticks(unsigned long ticks)
  * quota as real time scheduling and convert them back to SCHED_NORMAL.
  * Where possible, the data is tested lockless, to avoid grabbing grq_lock
  * because the occasional inaccurate result won't matter. However the
- * data is only ever modified under lock.
+ * tick data is only ever modified under lock. iso_refractory is only simply
+ * set to 0 or 1 so it's not worth grabbing the lock yet again for that.
  */
 static void set_iso_refractory(void)
 {
-	grq_lock();
 	grq.iso_refractory = 1;
-	grq_unlock();
 }
 
 static void clear_iso_refractory(void)
 {
-	grq_lock();
 	grq.iso_refractory = 0;
-	grq_unlock();
 }
 
 /*
@@ -2120,7 +2168,7 @@ static inline int longest_deadline(void)
 }
 
 /*
- * SCHED_IDLEPRIO tasks still have a deadline set, but offset by to nice +19.
+ * SCHED_IDLEPRIO tasks still have a deadline set, but offset by nice +19.
  * This allows nice levels to work between IDLEPRIO tasks and gives a
  * deadline longer than nice +19 for when they're scheduled as SCHED_NORMAL
  * tasks.
@@ -2189,10 +2237,9 @@ retry:
 		 * there is no need to initialise earliest_deadline
 		 * before. Normalise all old deadlines to now.
 		 */
-		if (time_before(p->deadline, jiffies))
+		dl = p->deadline + cache_distance(task_rq(p), rq, p);
+		if (time_before(dl, jiffies))
 			dl = jiffies;
-		else
-			dl = p->deadline;
 
 		if (edt == idle ||
 		    time_before(dl, earliest_deadline)) {
@@ -2261,6 +2308,12 @@ static inline void set_rq_task(struct rq *rq, struct task_struct *p)
 	rq->rq_time_slice = p->time_slice;
 	rq->rq_deadline = p->deadline;
 	rq->rq_last_ran = p->last_ran;
+	rq->rq_policy = p->policy;
+	rq->rq_prio = p->prio;
+}
+
+static void reset_rq_task(struct rq *rq, struct task_struct *p)
+{
 	rq->rq_policy = p->policy;
 	rq->rq_prio = p->prio;
 }
@@ -2347,7 +2400,7 @@ need_resched_nonpreemptible:
 		rq->curr = next;
 		++*switch_count;
 
-		context_switch(rq, prev, next); /* unlocks the rq */
+		context_switch(rq, prev, next); /* unlocks the grq */
 		/*
 		 * the context switch might have flipped the stack from under
 		 * us, hence refresh the local variables.
@@ -2508,7 +2561,7 @@ void __wake_up_locked_key(wait_queue_head_t *q, unsigned int mode, void *key)
  *
  * The sync wakeup differs that the waker knows that it will schedule
  * away soon, so while the target thread will be woken up, it will not
- * be migrated to another CPU - ie. the two threads are 'synchronized'
+ * be migrated to another CPU - ie. the two threads are 'synchronised'
  * with each other. This can prevent needless bouncing between CPUs.
  *
  * On UP it can prevent extra preemption.
@@ -2542,7 +2595,7 @@ EXPORT_SYMBOL_GPL(__wake_up_sync_key);
  *
  * The sync wakeup differs that the waker knows that it will schedule
  * away soon, so while the target thread will be woken up, it will not
- * be migrated to another CPU - ie. the two threads are 'synchronized'
+ * be migrated to another CPU - ie. the two threads are 'synchronised'
  * with each other. This can prevent needless bouncing between CPUs.
  *
  * On UP it can prevent extra preemption.
@@ -2907,8 +2960,10 @@ void set_user_nice(struct task_struct *p, long nice)
 	}
 
 	/* Just resched the task, schedule() will know what to do. */
-	if (task_running(p))
+	if (task_running(p)) {
 		resched_task(p);
+		reset_rq_task(rq, p);
+	}
 out_unlock:
 	task_grq_unlock(&flags);
 }
@@ -3046,8 +3101,10 @@ __setscheduler(struct task_struct *p, struct rq *rq, int policy, int prio)
 	 * Reschedule if running. schedule() will know if it can continue
 	 * running or not.
 	 */
-	if (task_running(p))
+	if (task_running(p)) {
 		resched_task(p);
+		reset_rq_task(rq, p);
+	}
 }
 
 /*
@@ -3816,7 +3873,7 @@ void show_state_filter(unsigned long state_filter)
  * NOTE: this function does not set the idle thread's NEED_RESCHED
  * flag, to make booting more robust.
  */
-void __cpuinit init_idle(struct task_struct *idle, int cpu)
+void init_idle(struct task_struct *idle, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
@@ -3964,7 +4021,7 @@ void wake_up_idle_cpu(int cpu)
 	 * This is safe, as this function is called with the timer
 	 * wheel base lock of (cpu) held. When the CPU is on the way
 	 * to idle and has not yet set rq->curr to idle then it will
-	 * be serialized on the timer wheel base lock and take the new
+	 * be serialised on the timer wheel base lock and take the new
 	 * timer into account automatically.
 	 */
 	if (unlikely(rq->curr != idle))
@@ -4433,7 +4490,7 @@ early_initcall(migration_init);
 #endif
 
 /*
- * sched_domains_mutex serializes calls to arch_init_sched_domains,
+ * sched_domains_mutex serialises calls to arch_init_sched_domains,
  * detach_destroy_domains and partition_sched_domains.
  */
 static DEFINE_MUTEX(sched_domains_mutex);
@@ -5069,7 +5126,7 @@ static void free_sched_groups(const struct cpumask *cpu_map,
 #endif /* CONFIG_NUMA */
 
 /*
- * Initialize sched groups cpu_power.
+ * Initialise sched groups cpu_power.
  *
  * cpu_power indicates the capacity of sched group, which is used while
  * distributing the load between different sched groups in a sched domain.
@@ -5121,7 +5178,7 @@ static void init_sched_groups_power(int cpu, struct sched_domain *sd)
 }
 
 /*
- * Initializers for schedule domains
+ * Initialisers for schedule domains
  * Non-inlined to reduce accumulated stack pressure in build_sched_domains()
  */
 
@@ -5528,7 +5585,7 @@ static struct sched_domain_attr *dattr_cur;
 static cpumask_var_t fallback_doms;
 
 /*
- * arch_update_cpu_topology lets virtualized architectures update the
+ * arch_update_cpu_topology lets virtualised architectures update the
  * cpu core maps. It is supposed to return 1 if the topology changed
  * or 0 if it stayed the same.
  */
@@ -5819,6 +5876,9 @@ static int update_runtime(struct notifier_block *nfb,
 
 void __init sched_init_smp(void)
 {
+	struct sched_domain *sd;
+	int cpu;
+
 	cpumask_var_t non_isolated_cpus;
 
 	alloc_cpumask_var(&non_isolated_cpus, GFP_KERNEL);
@@ -5858,6 +5918,35 @@ void __init sched_init_smp(void)
 	 * fashion.
 	 */
 	rr_interval *= 1 + ilog2(num_online_cpus());
+
+	/*
+	 * Set up the relative cache distance of each online cpu from each
+	 * other in a simple array for quick lookup. Locality is determined
+	 * by the closest sched_domain that CPUs are separated by. CPUs with
+	 * shared cache in SMT and MC are treated as local. Separate CPUs
+	 * (within the same package or physically) within the same node are
+	 * treated as not local. CPUs not even in the same domain (different
+	 * nodes) are treated as very distant.
+	 */
+	for_each_online_cpu(cpu) {
+		for_each_domain(cpu, sd) {
+			struct rq *rq = cpu_rq(cpu);
+			unsigned long locality;
+			int other_cpu;
+
+			if (sd->level <= SD_LV_MC)
+				locality = 0;
+			else if (sd->level <= SD_LV_NODE)
+				locality = 1;
+			else
+				continue;
+
+			for_each_cpu_mask(other_cpu, *sched_domain_span(sd)) {
+				if (locality < rq->cpu_locality[other_cpu])
+					rq->cpu_locality[other_cpu] = locality;
+			}
+		}
+	}
 }
 #else
 void __init sched_init_smp(void)
@@ -5874,7 +5963,7 @@ int in_sched_functions(unsigned long addr)
 		&& addr < (unsigned long)__sched_text_end);
 }
 
-void sched_init(void)
+void __init sched_init(void)
 {
 	int i;
 	int highest_cpu = 0;
@@ -5917,6 +6006,18 @@ void sched_init(void)
 
 #ifdef CONFIG_SMP
 	nr_cpu_ids = highest_cpu + 1;
+	for_each_possible_cpu(i) {
+		struct rq *rq = cpu_rq(i);
+		int j;
+
+		rq->cpu_locality = kmalloc(nr_cpu_ids * sizeof(unsigned long), GFP_NOWAIT);
+		for_each_possible_cpu(j) {
+			if (i == j)
+				rq->cpu_locality[j] = 0;
+			else
+				rq->cpu_locality[j] = 4;
+		}
+	}
 #endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -6042,7 +6143,7 @@ struct task_struct *curr_task(int cpu)
  * Description: This function must only be used when non-maskable interrupts
  * are serviced on a separate stack.  It allows the architecture to switch the
  * notion of the current task on a cpu in a non-blocking manner.  This function
- * must be called with all CPU's synchronized, and interrupts disabled, the
+ * must be called with all CPU's synchronised, and interrupts disabled, the
  * and caller must save the original value of the current task (see
  * curr_task() above) and restore that value before reenabling interrupts and
  * re-starting the system.

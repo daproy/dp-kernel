@@ -210,6 +210,7 @@ repeat:
 			leader->exit_state = EXIT_DEAD;
 	}
 
+	sched_exit(p);
 	write_unlock_irq(&tasklist_lock);
 	release_thread(p);
 	call_rcu(&p->rcu, delayed_put_task_struct);
