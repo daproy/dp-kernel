@@ -145,6 +145,11 @@ int rr_interval __read_mostly = 6;
 int sched_iso_cpu __read_mostly = 70;
 
 /*
+ * The relative length of deadline for each priority(nice) level.
+ */
+static int prio_ratios[PRIO_RANGE] __read_mostly;
+
+/*
  * The quota handed out to tasks of all priority levels when refilling their
  * time_slice.
  */
@@ -297,10 +302,18 @@ static inline int cpu_of(struct rq *rq)
 #define for_each_domain(cpu, __sd) \
 	for (__sd = rcu_dereference(cpu_rq(cpu)->sd); __sd; __sd = __sd->parent)
 
+#ifdef CONFIG_SMP
 #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
 #define this_rq()		(&__get_cpu_var(runqueues))
 #define task_rq(p)		cpu_rq(task_cpu(p))
 #define cpu_curr(cpu)		(cpu_rq(cpu)->curr)
+#else /* CONFIG_SMP */
+static struct rq *uprq;
+#define cpu_rq(cpu)	(uprq)
+#define this_rq()	(uprq)
+#define task_rq(p)	(uprq)
+#define cpu_curr(cpu)	((uprq)->curr)
+#endif
 
 #include "sched_stats.h"
 
@@ -561,6 +574,11 @@ static inline void requeue_task(struct task_struct *p)
 	sched_info_queued(p);
 }
 
+static inline int task_prio_ratio(struct task_struct *p)
+{
+	return prio_ratios[TASK_USER_PRIO(p)];
+}
+
 /*
  * task_timeslice - all tasks of all priorities get the exact same timeslice
  * length. CPU distribution is handled by giving different deadlines to
@@ -568,7 +586,7 @@ static inline void requeue_task(struct task_struct *p)
  */
 static inline int task_timeslice(struct task_struct *p)
 {
-	return (TASK_USER_PRIO(p) + 1) * rr_interval;
+	return (rr_interval * task_prio_ratio(p) / 100);
 }
 
 #ifdef CONFIG_SMP
@@ -923,11 +941,14 @@ unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 		 * work out! In the unlikely event rq is dereferenced
 		 * since we're lockless, grab it again.
 		 */
+#ifdef CONFIG_SMP
 retry_rq:
 		rq = task_rq(p);
 		if (unlikely(!rq))
 			goto retry_rq;
-
+#else /* CONFIG_SMP */
+		rq = task_rq(p);
+#endif
 		/*
 		 * If the task is actively running on another CPU
 		 * still, just relax and busy-wait without holding
@@ -1061,20 +1082,27 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 		offset_deadline = -cache_distance(this_rq, rq, p);
 		if (rq_prio != PRIO_LIMIT)
 			offset_deadline += rq->rq_deadline;
+		else
+			if (rq == this_rq) {
+				/* this_rq is idle, use that over everything */
+				highest_prio_rq = rq;
+				goto out;
+			}
 
-		if (rq_prio > highest_prio || (rq_prio == highest_prio &&
+		if (rq_prio > highest_prio ||
 		    (time_after(offset_deadline, latest_deadline) ||
-		    (this_rq == rq && offset_deadline == latest_deadline)))) {
+		    (offset_deadline == latest_deadline && this_rq == rq))) {
 			latest_deadline = offset_deadline;
 			highest_prio = rq_prio;
 			highest_prio_rq = rq;
 		}
 	}
 
-	if (p->prio > highest_prio || (p->policy == SCHED_NORMAL &&
-	    p->prio == highest_prio && !time_before(p->deadline, latest_deadline)))
+	if (p->prio > highest_prio || (p->prio == highest_prio &&
+	    p->policy == SCHED_NORMAL && !time_before(p->deadline, latest_deadline)))
 	    	return;
 
+out:
 	/* p gets to preempt highest_prio_rq->curr */
 	resched_task(highest_prio_rq->curr);
 	return;
@@ -1259,6 +1287,7 @@ void wake_up_new_task(struct task_struct *p, unsigned long clone_flags)
 	parent = p->parent;
 
 	BUG_ON(p->state != TASK_RUNNING);
+    /* Unnecessary but small chance that the parent changed cpus */
 	set_task_cpu(p, task_cpu(parent));
 	activate_task(p, rq);
 	if (!(clone_flags & CLONE_VM) && rq->curr == parent &&
@@ -1268,7 +1297,7 @@ void wake_up_new_task(struct task_struct *p, unsigned long clone_flags)
 		 * do child-runs-first in anticipation of an exec. This
 		 * usually avoids a lot of COW overhead.
 		 */
-			resched_task(parent);
+		resched_task(parent);
 	} else
 		try_preempt(p, rq);
 	task_grq_unlock(&flags);
@@ -1293,10 +1322,10 @@ void sched_exit(struct task_struct *p)
 		int *par_tslice, *p_tslice;
 
 		parent = p->parent;
-		rq = task_grq_lock(parent, &flags);
 		par_tslice = &parent->time_slice;
 		p_tslice = &p->time_slice;
 
+		rq = task_grq_lock(parent, &flags);
 		/* The real time_slice of the "curr" task is on the rq var.*/
 		if (p == rq->curr)
 			p_tslice = &rq->rq_time_slice;
@@ -1525,7 +1554,7 @@ unsigned long nr_running(void)
 
 unsigned long nr_uninterruptible(void)
 {
-	unsigned long nu = grq.nr_uninterruptible;
+	long nu = grq.nr_uninterruptible;
 
 	if (unlikely(nu < 0))
 		nu = 0;
@@ -1768,7 +1797,7 @@ update_cpu_clock(struct rq *rq, struct task_struct *p, int tick)
  * Return any ns on the sched_clock that have not yet been accounted in
  * @p in case that task is currently running.
  *
- * Called with task_grq_lock() held on @rq.
+ * Called with task_grq_lock() held.
  */
 static u64 do_task_delta_exec(struct task_struct *p, struct rq *rq)
 {
@@ -2134,7 +2163,7 @@ EXPORT_SYMBOL(sub_preempt_count);
  */
 static inline int prio_deadline_diff(int user_prio)
 {
-	return (user_prio + 1) * rr_interval * HZ / 500;
+	return (prio_ratios[user_prio] * rr_interval * HZ / (1000 * 100)) ? : 1;
 }
 
 static inline int task_deadline_diff(struct task_struct *p)
@@ -2217,6 +2246,15 @@ retry:
 		}
 
 		dl = p->deadline + cache_distance(task_rq(p), rq, p);
+
+		/*
+		 * Look for tasks with old deadlines and pick them in FIFO
+		 * order, taking the first one found.
+		 */
+		if (time_before(dl, jiffies)) {
+			edt = p;
+			goto out_take;
+		}
 
 		/*
 		 * No rt tasks. Find the earliest deadline task. Now we're in
@@ -5999,9 +6037,15 @@ void __init sched_init(void)
 	int i;
 	struct rq *rq;
 
+	prio_ratios[0] = 100;
+	for (i = 1 ; i < PRIO_RANGE ; i++)
+		prio_ratios[i] = prio_ratios[i - 1] * 11 / 10;
+
 	spin_lock_init(&grq.lock);
 #ifdef CONFIG_SMP
 	init_defrootdomain();
+#else
+	uprq = &per_cpu(runqueues, 0);
 #endif
 	for_each_possible_cpu(i) {
 		rq = cpu_rq(i);
