@@ -2138,7 +2138,7 @@ static inline void no_iso_tick(void)
 {
 	if (grq.iso_ticks) {
 		grq_lock();
-		grq.iso_ticks = grq.iso_ticks * (ISO_PERIOD - 1) / ISO_PERIOD;
+		grq.iso_ticks -= grq.iso_ticks / ISO_PERIOD + 1;
 		if (unlikely(grq.iso_refractory && grq.iso_ticks /
 		    ISO_PERIOD < (sched_iso_cpu * 90 / 100)))
 			clear_iso_refractory();
