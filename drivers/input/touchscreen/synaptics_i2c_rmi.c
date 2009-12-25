@@ -1,4 +1,4 @@
-/* drivers/input/touchscreen/synaptics_i2c_rmi.c
+/* drivers/input/keyboard/synaptics_i2c_rmi.c
  *
  * Copyright (C) 2007 Google, Inc.
  *
@@ -166,8 +166,7 @@ static void synaptics_ts_work_func(struct work_struct *work)
 						p |= (uint16_t)(buf[base] & 0x1f) << 8;
 						if (ts->flags & flip_flag)
 							p = ts->max[a] - p;
-						/* Snap to the the edges if requested, but never during multitouch */
-						if (!finger2_pressed && (ts->flags & SYNAPTICS_SNAP_TO_INACTIVE_EDGE)) {
+						if (ts->flags & SYNAPTICS_SNAP_TO_INACTIVE_EDGE) {
 							if (ts->snap_state[f][a]) {
 								if (p <= ts->snap_down_off[a])
 									p = ts->snap_down[a];
