@@ -335,7 +335,7 @@ static void __oom_kill_task(struct task_struct *p, int verbose)
 	 * exit() and clear out its resources quickly...
 	 */
 	p->time_slice = HZ;
-	set_tsk_thread_flag(p, TIF_MEMDIE);
+	set_oom_timeslice(p);
 
 	force_sig(SIGKILL, p);
 }
